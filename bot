@@ -1,0 +1,625 @@
+import os
+import json
+import random
+import re
+import logging
+from datetime import datetime, timedelta
+from typing import List, Set, Optional, Dict
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    CallbackContext,
+    filters,
+    MessageHandler
+)
+
+# --- Configuration ---
+BOT_TOKEN = "7579241847:AAEr_ZlDsfcD2Ouxd4f3a9FpEbztbFrIMS4"  # Replace with your actual bot token
+ADMIN_IDS = [6637067482]  # Replace with your admin ID(s)
+DATABASE_DIR = "data"
+KEYS_FILE = os.path.join(DATABASE_DIR, "keys.json")
+USERS_FILE = os.path.join(DATABASE_DIR, "users.json")
+SEARCH_HISTORY_FILE = os.path.join(DATABASE_DIR, "search_history.json")
+LOG_FILE = os.path.join(DATABASE_DIR, "bot.log")
+DATABASE_FILES = [os.path.join(DATABASE_DIR, "database.txt")]
+MAX_RESULTS = 1000
+RESULTS_PER_PAGE = 50
+MAX_KEY_GENERATION = 50
+LICENSE_PREFIX = "NEXUS-"
+
+# Ensure data directory exists
+os.makedirs(DATABASE_DIR, exist_ok=True)
+
+# --- Logging Setup ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class BotDatabase:
+    """Enhanced database handler with caching and atomic operations"""
+    
+    def __init__(self):
+        self.keys = self._load_json(KEYS_FILE, {"keys": {}, "user_keys": {}, "logs": {}})
+        self.users = self._load_json(USERS_FILE, {})
+        self.search_history = self._load_json(SEARCH_HISTORY_FILE, {})
+        self.database_cache = self._load_database_cache()
+        
+    def _load_json(self, path: str, default=None):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return default if default is not None else {}
+    
+    def _save_json(self, path: str, data):
+        temp_path = f"{path}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        os.replace(temp_path, path)
+    
+    def _load_database_cache(self) -> Dict[str, List[str]]:
+        """Load all database files into memory for faster searching"""
+        cache = {}
+        for db_file in DATABASE_FILES:
+            if os.path.exists(db_file):
+                try:
+                    with open(db_file, "r", encoding="utf-8", errors="ignore") as f:
+                        cache[db_file] = [line.strip() for line in f if line.strip()]
+                except Exception as e:
+                    logger.error(f"Error loading {db_file}: {str(e)}")
+                    cache[db_file] = []
+        return cache
+    
+    def refresh_cache(self):
+        """Refresh the database cache"""
+        self.database_cache = self._load_database_cache()
+    
+    def save_keys(self):
+        self._save_json(KEYS_FILE, self.keys)
+    
+    def save_users(self):
+        self._save_json(USERS_FILE, self.users)
+    
+    def save_search_history(self):
+        self._save_json(SEARCH_HISTORY_FILE, self.search_history)
+    
+    def add_searched_lines(self, user_id: int, lines: List[str]):
+        user_id = str(user_id)
+        if user_id not in self.search_history:
+            self.search_history[user_id] = []
+        
+        new_lines = [line for line in lines if line not in self.search_history[user_id]]
+        if new_lines:
+            self.search_history[user_id].extend(new_lines)
+            self.save_search_history()
+    
+    def get_user_searches(self, user_id: int) -> Set[str]:
+        return set(self.search_history.get(str(user_id), []))
+
+# Initialize database
+db = BotDatabase()
+
+# --- Utility Functions ---
+def generate_license_key(length: int = 16) -> str:
+    """Generate a secure license key"""
+    chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return LICENSE_PREFIX + "".join(random.choices(chars, k=length))
+
+def calculate_expiry(duration: str) -> Optional[float]:
+    """Calculate expiry timestamp based on duration"""
+    if duration == "lifetime":
+        return None
+    
+    duration_map = {
+        "1h": 3600,
+        "1d": 86400,
+        "7d": 604800,
+        "30d": 2592000,
+        "90d": 7776000
+    }
+    
+    if duration not in duration_map:
+        raise ValueError(f"Invalid duration: {duration}")
+    
+    return (datetime.now() + timedelta(seconds=duration_map[duration])).timestamp()
+
+def format_duration(duration: str) -> str:
+    """Convert duration code to human-readable format"""
+    return {
+        "1h": "1 hour",
+        "1d": "1 day",
+        "7d": "1 week",
+        "30d": "1 month",
+        "90d": "3 months",
+        "lifetime": "Lifetime"
+    }.get(duration, duration)
+
+def sanitize_credentials(line: str) -> Optional[str]:
+    """Extract username:password from line, ignoring URLs and junk"""
+    line = line.strip()
+    if not line or line.count(":") != 1:
+        return None
+    
+    # Remove common garbage prefixes
+    for prefix in ["unknown:", "invalid_", "error_"]:
+        if line.lower().startswith(prefix):
+            return None
+    
+    username, password = line.split(":", 1)
+    username = username.strip()
+    password = password.strip()
+    
+    # Basic validation
+    if not username or not password:
+        return None
+    if len(password) < 4 or len(password) > 100:
+        return None
+    
+    return f"{username}:{password}"
+
+def log_activity(user_id: int, action: str, details: str = ""):
+    """Log user activity with timestamp"""
+    timestamp = datetime.now().isoformat()
+    log_entry = f"{timestamp} - User {user_id} - {action}"
+    if details:
+        log_entry += f" - {details}"
+    logger.info(log_entry)
+    
+    # Store in database logs
+    if "logs" not in db.keys:
+        db.keys["logs"] = {}
+    db.keys["logs"][str(user_id)] = db.keys["logs"].get(str(user_id), []) + [log_entry]
+    db.save_keys()
+
+# --- Command Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Welcome message and bot introduction"""
+    user = update.effective_user
+    log_activity(user.id, "start_command")
+    
+    welcome_msg = f"""
+🌟 *Welcome to Nexus Search Bot* 🌟
+
+🔍 *Advanced credential search engine*
+⚡ Lightning-fast database queries
+🔒 Secure and private searches
+
+📌 *Available Commands:*
+/search - Find credentials
+/key - Activate your license
+/help - Show all commands
+
+🔐 Your User ID: `{user.id}`
+"""
+    await update.message.reply_text(
+        welcome_msg,
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show help information"""
+    help_text = """
+🆘 *Nexus Bot Help* 🆘
+
+🔍 *Search Commands:*
+/search <query> - Search database
+/search <query1> <query2> - Multiple keywords
+
+🔑 *License Commands:*
+/key <license> - Activate license
+/mykey - Show your current license
+/status - Check your account status
+
+👨‍💻 *Admin Commands:*
+/genkey <duration> [amount] - Generate licenses
+/stats - Show bot statistics
+/export - Export user data
+
+📌 *Examples:*
+/search gmail.com
+/search outlook.com password123
+/key NEXUS-ABCD1234
+"""
+    await update.message.reply_text(
+        help_text,
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True
+    )
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle search requests with optimized speed"""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    
+    # Check license
+    if str(chat_id) not in db.keys.get("user_keys", {}):
+        await update.message.reply_text(
+            "🔒 *License Required*\n\n"
+            "You need a valid license to use this bot.\n"
+            "Use /key to activate your license.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Validate query
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ *Usage:* /search <query>\n"
+            "Example: /search gmail.com",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    keywords = [kw.lower() for kw in context.args]
+    log_activity(user.id, "search", f"keywords: {' '.join(keywords)}")
+    
+    # Get user's already seen lines
+    user_searches = db.get_user_searches(user.id)
+    
+    # Search databases
+    results = set()
+    
+    for db_file, lines in db.database_cache.items():
+        for line in lines:
+            # Skip already seen lines
+            if line in user_searches:
+                continue
+            
+            # Check if line matches all keywords
+            line_lower = line.lower()
+            if all(kw in line_lower for kw in keywords):
+                clean_line = sanitize_credentials(line)
+                if clean_line:
+                    results.add(clean_line)
+                    
+            if len(results) >= MAX_RESULTS:
+                break
+    
+    if not results:
+        await update.message.reply_text(
+            "🔍 *No results found*\n\n"
+            "Try different keywords or broader search terms.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Store results for pagination
+    results = sorted(results)
+    context.user_data["search_results"] = results
+    context.user_data["search_page"] = 0
+    context.user_data["search_keywords"] = keywords
+    
+    # Log the found lines
+    db.add_searched_lines(user.id, results)
+    
+    # Show format options
+    keyboard = [
+        [
+            InlineKeyboardButton("🔒 Clean Format", callback_data="format_clean"),
+            InlineKeyboardButton("📝 Raw Format", callback_data="format_raw"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"✅ *Found {len(results)} results*\n\n"
+        "Choose your preferred output format:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle format selection callback"""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    action = query.data  # format_clean or format_raw
+    
+    results = context.user_data.get("search_results", [])
+    if not results:
+        await query.edit_message_text("❌ Search results expired or not found")
+        return
+    
+    clean_format = action == "format_clean"
+    page = 0
+    
+    # Prepare results based on format
+    if clean_format:
+        display_results = results
+    else:
+        display_results = [f"🔍 {line}" for line in results]
+    
+    # Store format preference
+    context.user_data["clean_format"] = clean_format
+    
+    # Show first page
+    await show_results_page(query, context, page)
+
+async def show_results_page(query, context: CallbackContext, page: int):
+    """Display a page of search results"""
+    results = context.user_data.get("search_results", [])
+    clean_format = context.user_data.get("clean_format", True)
+    keywords = context.user_data.get("search_keywords", [])
+    
+    total_pages = (len(results) - 1) // RESULTS_PER_PAGE + 1
+    page = max(0, min(page, total_pages - 1))
+    
+    start_idx = page * RESULTS_PER_PAGE
+    end_idx = start_idx + RESULTS_PER_PAGE
+    page_results = results[start_idx:end_idx]
+    
+    # Format page results
+    if clean_format:
+        display_lines = page_results
+    else:
+        display_lines = [f"🔍 {line}" for line in page_results]
+    
+    # Build message text
+    message_text = (
+        f"🔍 *Search Results* - Page {page + 1}/{total_pages}\n"
+        f"📝 Query: {' '.join(keywords)}\n"
+        f"📊 Results: {start_idx + 1}-{end_idx} of {len(results)}\n\n"
+    ) + "\n".join(display_lines)
+    
+    # Build pagination buttons
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"page_{page-1}"))
+    if page < total_pages - 1:
+        buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"page_{page+1}"))
+    
+    reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
+    
+    # Edit the message
+    try:
+        await query.edit_message_text(
+            message_text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.error(f"Error editing message: {str(e)}")
+
+async def handle_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle pagination callbacks"""
+    query = update.callback_query
+    await query.answer()
+    
+    if not query.data.startswith("page_"):
+        return
+    
+    page = int(query.data.split("_")[1])
+    await show_results_page(query, context, page)
+
+async def generate_keys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate license keys (admin only)"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Administrator access required")
+        return
+    
+    if not context.args or context.args[0] not in ["1h", "1d", "7d", "30d", "90d", "lifetime"]:
+        await update.message.reply_text(
+            "⚠️ *Usage:* /genkey <duration> [amount]\n\n"
+            "🕒 *Durations:* 1h, 1d, 7d, 30d, 90d, lifetime\n"
+            "🔢 *Amount:* 1-50 (default: 1)",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    duration = context.args[0]
+    amount = 1
+    
+    if len(context.args) > 1:
+        try:
+            amount = min(max(1, int(context.args[1])), MAX_KEY_GENERATION)
+        except ValueError:
+            amount = 1
+    
+    log_activity(user.id, "generate_keys", f"{amount} {duration} keys")
+    
+    generated_keys = []
+    for _ in range(amount):
+        key = generate_license_key()
+        expiry = calculate_expiry(duration)
+        db.keys["keys"][key] = expiry
+        generated_keys.append(key)
+    
+    db.save_keys()
+    
+    keys_list = "\n".join(f"• `{key}`" for key in generated_keys)
+    duration_text = format_duration(duration)
+    
+    await update.message.reply_text(
+        f"🔑 *{amount} License Keys Generated* 🔑\n\n"
+        f"⏳ *Duration:* {duration_text}\n"
+        f"👤 *Generated by:* @{user.username or 'admin'}\n\n"
+        f"{keys_list}\n\n"
+        "_Keys have been added to the database_",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def activate_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Activate a license key"""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text(
+            "⚠️ *Usage:* /key <license>\n"
+            "Example: /key NEXUS-ABCD1234",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    license_key = context.args[0].upper()
+    
+    if not license_key.startswith(LICENSE_PREFIX):
+        await update.message.reply_text(
+            "❌ *Invalid License Format*\n"
+            "License keys must start with " + LICENSE_PREFIX,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    if license_key not in db.keys.get("keys", {}):
+        await update.message.reply_text(
+            "❌ *Invalid License*\n"
+            "This key doesn't exist or has already been used.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    expiry = db.keys["keys"][license_key]
+    
+    # Check if expired
+    if expiry and datetime.now().timestamp() > expiry:
+        del db.keys["keys"][license_key]
+        db.save_keys()
+        await update.message.reply_text(
+            "⌛ *License Expired*\n"
+            "This key is no longer valid.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Register user
+    user_data = {
+        "username": user.username or "Unknown",
+        "license": license_key,
+        "activated": datetime.now().isoformat(),
+        "expiry": expiry,
+        "searches": 0
+    }
+    
+    db.users[str(user.id)] = user_data
+    db.save_users()
+    
+    # Activate license
+    db.keys["user_keys"][str(chat_id)] = expiry
+    del db.keys["keys"][license_key]
+    db.save_keys()
+    
+    log_activity(user.id, "activate_license", license_key)
+    
+    duration_text = "Lifetime" if expiry is None else "expires " + datetime.fromtimestamp(expiry).strftime("%Y-%m-%d")
+    
+    await update.message.reply_text(
+        "🎉 *License Activated* 🎉\n\n"
+        f"👤 User: @{user.username or 'Unknown'}\n"
+        f"🔑 License: `{license_key}`\n"
+        f"⏳ Status: {duration_text}\n\n"
+        "You can now use /search to query the database.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def user_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user account status"""
+    user = update.effective_user
+    chat_id = str(update.effective_chat.id)
+    
+    user_data = db.users.get(str(user.id), {})
+    expiry = db.keys["user_keys"].get(chat_id)
+    
+    if not expiry and expiry != 0:  # 0 is special case for lifetime
+        await update.message.reply_text(
+            "🔒 *No Active License*\n\n"
+            "You need to activate a license with /key",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    if expiry and datetime.now().timestamp() > expiry:
+        await update.message.reply_text(
+            "⌛ *License Expired*\n\n"
+            "Your license has expired. Please renew.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    license_key = user_data.get("license", "Unknown")
+    searches = user_data.get("searches", 0)
+    
+    if expiry is None:
+        expiry_text = "Lifetime"
+    else:
+        expiry_date = datetime.fromtimestamp(expiry)
+        expiry_text = expiry_date.strftime("%Y-%m-%d %H:%M:%S")
+    
+    await update.message.reply_text(
+        "📊 *Account Status*\n\n"
+        f"👤 User: @{user.username or 'Unknown'}\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"🔑 License: `{license_key}`\n"
+        f"⏳ Expiry: {expiry_text}\n"
+        f"🔍 Searches: {searches}",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle unknown commands"""
+    await update.message.reply_text(
+        "⚠️ Unknown command. Type /help for available commands.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors and notify user"""
+    logger.error(f"Update {update} caused error: {context.error}", exc_info=context.error)
+    
+    if isinstance(update, Update):
+        chat_id = update.effective_chat.id
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ An error occurred. Please try again later."
+        )
+# --- Bot Setup ---
+def setup_handlers(application: Application):
+    """Register all command and callback handlers"""
+    # Command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("genkey", generate_keys, filters=filters.User(ADMIN_IDS)))
+    application.add_handler(CommandHandler("key", activate_license))
+    application.add_handler(CommandHandler("status", user_status))
+    application.add_handler(CommandHandler("mykey", user_status))  # Alias for status
+    
+    # Callback handlers
+    application.add_handler(CallbackQueryHandler(handle_format_selection, pattern=r"format_(clean|raw)"))
+    application.add_handler(CallbackQueryHandler(handle_pagination, pattern=r"page_\d+"))
+    
+    # Unknown command handler (must be last)
+    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    
+    # Error handler
+    application.add_error_handler(error_handler)
+
+def run_bot():
+    """Start the bot"""
+    application = Application.builder().token(BOT_TOKEN).build()
+    setup_handlers(application)
+    
+    logger.info("🚀 Nexus Search Bot is now running!")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    run_bot()
